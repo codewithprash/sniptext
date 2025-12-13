@@ -1,0 +1,16 @@
+{
+	"compatibility_date": "2025-10-08",
+	"main": "src/index.ts",
+	"name": "sniptext",
+	"upload_source_maps": true,
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_id": "bbcdb16b-b926-4492-9116-3a180b4e500b",
+			"database_name": "sniptext"
+		}
+	],
+	"observability": {
+		"enabled": true
+	}
+}
