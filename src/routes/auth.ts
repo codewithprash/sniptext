@@ -1,11 +1,11 @@
 import { Hono } from 'hono';
+import { sign, verify } from 'hono/jwt';
 
 type Bindings = {
   DB: D1Database;
   JWT_SECRET: string;
 };
 
-// Type definition for Google token info
 interface GoogleTokenInfo {
   email: string;
   email_verified: string;
@@ -16,18 +16,16 @@ interface GoogleTokenInfo {
 
 export const authRoutes = new Hono<{ Bindings: Bindings }>();
 
-// POST /api/auth/google - Google OAuth authentication
+// POST /auth/google - Google OAuth login
 authRoutes.post('/google', async (c) => {
   try {
     const { googleToken, email, name, picture } = await c.req.json();
-
-    console.log('Google auth request for:', email);
 
     if (!email) {
       return c.json({ error: 'Missing email' }, 400);
     }
 
-    // Optional: Verify Google token with Google's API (recommended for production)
+    // Verify Google token
     if (googleToken) {
       try {
         const verifyResponse = await fetch(
@@ -35,14 +33,11 @@ authRoutes.post('/google', async (c) => {
         );
 
         if (!verifyResponse.ok) {
-          console.error('Google token verification failed');
           return c.json({ error: 'Invalid Google token' }, 401);
         }
 
         const tokenInfo = await verifyResponse.json() as GoogleTokenInfo;
-        console.log('Google token verified:', tokenInfo.email);
-
-        // Ensure the email matches
+        
         if (tokenInfo.email !== email) {
           return c.json({ error: 'Email mismatch' }, 401);
         }
@@ -54,39 +49,35 @@ authRoutes.post('/google', async (c) => {
 
     // Find or create user
     let user = await c.env.DB
-      .prepare('SELECT id, email, plan FROM users WHERE email = ?')
+      .prepare('SELECT id, email, plan, name, picture FROM users WHERE email = ?')
       .bind(email)
-      .first<{ id: string; email: string; plan: string }>();
+      .first<{ id: string; email: string; plan: string; name: string | null; picture: string | null }>();
 
     if (!user) {
-      // Create new user with free plan
       const userId = crypto.randomUUID();
-      console.log('Creating new user:', userId, email);
-
       await c.env.DB
-        .prepare(
-          'INSERT INTO users (id, email, plan, created_at) VALUES (?, ?, ?, ?)'
-        )
-        .bind(userId, email, 'free', new Date().toISOString())
+        .prepare('INSERT INTO users (id, email, name, picture, plan, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .bind(userId, email, name || null, picture || null, 'free', new Date().toISOString())
         .run();
-
-      user = { id: userId, email, plan: 'free' };
-    } else {
-      console.log('Existing user found:', user.id);
+      user = { id: userId, email, plan: 'free', name: name || null, picture: picture || null };
+    } else if (name || picture) {
+      // Update name/picture if provided
+      await c.env.DB
+        .prepare('UPDATE users SET name = ?, picture = ?, updated_at = ? WHERE id = ?')
+        .bind(name || user.name, picture || user.picture, new Date().toISOString(), user.id)
+        .run();
     }
 
-    // Generate JWT token
+    // Generate secure JWT
     const payload = {
       sub: user.id,
       email: user.email,
       plan: user.plan,
       iat: Math.floor(Date.now() / 1000),
-      exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 30) // 30 days
+      exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 30), // 30 days
     };
 
-    const token = btoa(JSON.stringify(payload));
-
-    console.log('Authentication successful for:', email);
+    const token = await sign(payload, c.env.JWT_SECRET);
 
     return c.json({
       success: true,
@@ -94,20 +85,21 @@ authRoutes.post('/google', async (c) => {
       user: {
         id: user.id,
         email: user.email,
-        plan: user.plan
-      }
+        name: user.name,
+        picture: user.picture,
+        plan: user.plan,
+      },
     });
-
   } catch (error) {
     console.error('Google auth error:', error);
-    return c.json({ 
+    return c.json({
       error: 'Authentication failed',
-      details: error instanceof Error ? error.message : 'Unknown error'
+      details: error instanceof Error ? error.message : 'Unknown error',
     }, 500);
   }
 });
 
-// GET /api/auth/me - Get current user info (requires auth)
+// GET /auth/me - Get current user
 authRoutes.get('/me', async (c) => {
   const authHeader = c.req.header('Authorization');
   
@@ -117,43 +109,46 @@ authRoutes.get('/me', async (c) => {
 
   try {
     const token = authHeader.substring(7);
-    const payload = JSON.parse(atob(token)) as {
+    const payload = await verify(token, c.env.JWT_SECRET) as {
       sub: string;
       email: string;
       plan: string;
-      exp: number;
     };
 
-    // Check expiration
-    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
-      return c.json({ error: 'Token expired' }, 401);
-    }
-
     const user = await c.env.DB
-      .prepare('SELECT id, email, plan, created_at FROM users WHERE id = ?')
+      .prepare('SELECT id, email, name, picture, plan, created_at FROM users WHERE id = ?')
       .bind(payload.sub)
-      .first<{ id: string; email: string; plan: string; created_at: string }>();
+      .first<{ 
+        id: string; 
+        email: string; 
+        name: string | null;
+        picture: string | null;
+        plan: string; 
+        created_at: string 
+      }>();
 
     if (!user) {
       return c.json({ error: 'User not found' }, 404);
     }
 
-    return c.json({ 
+    return c.json({
       success: true,
       user: {
         id: user.id,
         email: user.email,
+        name: user.name,
+        picture: user.picture,
         plan: user.plan,
-        createdAt: user.created_at
-      }
+        createdAt: user.created_at,
+      },
     });
   } catch (error) {
-    console.error('Get user error:', error);
-    return c.json({ error: 'Invalid token' }, 401);
+    console.error('Token verification failed:', error);
+    return c.json({ error: 'Invalid or expired token' }, 401);
   }
 });
 
-// POST /api/auth/refresh - Refresh token
+// POST /auth/refresh - Refresh token
 authRoutes.post('/refresh', async (c) => {
   const authHeader = c.req.header('Authorization');
   
@@ -163,13 +158,8 @@ authRoutes.post('/refresh', async (c) => {
 
   try {
     const token = authHeader.substring(7);
-    const payload = JSON.parse(atob(token)) as {
-      sub: string;
-      email: string;
-      plan: string;
-    };
+    const payload = await verify(token, c.env.JWT_SECRET) as { sub: string };
 
-    // Get latest user data
     const user = await c.env.DB
       .prepare('SELECT id, email, plan FROM users WHERE id = ?')
       .bind(payload.sub)
@@ -179,16 +169,15 @@ authRoutes.post('/refresh', async (c) => {
       return c.json({ error: 'User not found' }, 404);
     }
 
-    // Generate new token
     const newPayload = {
       sub: user.id,
       email: user.email,
       plan: user.plan,
       iat: Math.floor(Date.now() / 1000),
-      exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 30)
+      exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 30),
     };
 
-    const newToken = btoa(JSON.stringify(newPayload));
+    const newToken = await sign(newPayload, c.env.JWT_SECRET);
 
     return c.json({
       success: true,
@@ -196,97 +185,19 @@ authRoutes.post('/refresh', async (c) => {
       user: {
         id: user.id,
         email: user.email,
-        plan: user.plan
-      }
+        plan: user.plan,
+      },
     });
-
   } catch (error) {
-    console.error('Refresh token error:', error);
+    console.error('Refresh error:', error);
     return c.json({ error: 'Token refresh failed' }, 500);
   }
 });
 
-// DELETE /api/auth/logout - Logout (revoke token)
-authRoutes.delete('/logout', async (c) => {
-  // With JWT, logout is handled client-side by deleting the token
-  // You could implement a token blacklist in D1 if needed
-  
+// DELETE /auth/logout
+authRoutes.delete('/logout', (c) => {
   return c.json({
     success: true,
-    message: 'Logged out successfully'
+    message: 'Logged out successfully',
   });
-});
-
-// GET /api/auth/status - Check auth status
-authRoutes.get('/status', async (c) => {
-  const authHeader = c.req.header('Authorization');
-  
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return c.json({ 
-      authenticated: false,
-      message: 'No auth token provided'
-    });
-  }
-
-  try {
-    const token = authHeader.substring(7);
-    const payload = JSON.parse(atob(token)) as {
-      sub: string;
-      exp: number;
-    };
-
-    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
-      return c.json({ 
-        authenticated: false,
-        message: 'Token expired'
-      });
-    }
-
-    const user = await c.env.DB
-      .prepare('SELECT id FROM users WHERE id = ?')
-      .bind(payload.sub)
-      .first();
-
-    return c.json({
-      authenticated: !!user,
-      message: user ? 'Valid token' : 'User not found'
-    });
-
-  } catch (error) {
-    return c.json({ 
-      authenticated: false,
-      message: 'Invalid token'
-    });
-  }
-});
-
-// DEBUG endpoint - Get all users (REMOVE IN PRODUCTION)
-authRoutes.get('/debug/users', async (c) => {
-  const users = await c.env.DB
-    .prepare('SELECT id, email, plan, created_at FROM users ORDER BY created_at DESC LIMIT 10')
-    .all();
-  
-  return c.json({
-    users: users.results,
-    count: users.results?.length || 0
-  });
-});
-
-// DEBUG endpoint - Check database connection (REMOVE IN PRODUCTION)
-authRoutes.get('/debug/db', async (c) => {
-  try {
-    const result = await c.env.DB
-      .prepare('SELECT COUNT(*) as count FROM users')
-      .first<{ count: number }>();
-    
-    return c.json({
-      status: 'connected',
-      totalUsers: result?.count || 0
-    });
-  } catch (error) {
-    return c.json({
-      status: 'error',
-      error: error instanceof Error ? error.message : 'Unknown error'
-    }, 500);
-  }
 });

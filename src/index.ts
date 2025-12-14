@@ -1,82 +1,78 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-
-// Import your route modules (we'll create these next)
 import { authRoutes } from './routes/auth';
 import { ocrRoutes } from './routes/ocr';
+import { analyticsRoutes } from './routes/analytics';
 
-// Type definitions for your environment bindings
 type Bindings = {
   DB: D1Database;
   JWT_SECRET: string;
   GEMINI_API_KEY: string;
+  ADMIN_KEY?: string;
 };
 
-// Create Hono app with proper typing
 const app = new Hono<{ Bindings: Bindings }>();
 
-// Enable CORS for Chrome extension
+// CORS middleware
 app.use('/*', cors({
   origin: '*',
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
+  maxAge: 86400,
 }));
 
-// Root endpoint - API info
-app.get('/', (c) => {
-  return c.json({
-    name: 'SnipText API',
-    version: '1.0.0',
-    endpoints: {
-      auth_login: 'POST /api/auth/login',
-      auth_verify_link: 'GET /api/auth/verify',
-      auth_poll: 'GET /api/auth/poll',
-      ocr: 'POST /api/ocr (requires auth)',
-    },
-    database: 'Connected to D1',
-  });
+// Request logging middleware
+app.use('/*', async (c, next) => {
+  const start = Date.now();
+  await next();
+  const ms = Date.now() - start;
+  console.log(`${c.req.method} ${c.req.path} - ${c.res.status} (${ms}ms)`);
 });
 
-// Health check endpoint
+// ✅ Root endpoint - Redirect to landing page
+app.get('/', (c) => {
+  return c.redirect('https://sniptext.pages.dev/', 301);
+});
+
+// Health check (keep for monitoring)
 app.get('/health', async (c) => {
   try {
-    // Test DB connection
     const result = await c.env.DB.prepare('SELECT 1 as test').first();
-    return c.json({ 
+    return c.json({
       status: 'healthy',
       database: result ? 'connected' : 'error',
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    return c.json({ 
+    return c.json({
       status: 'unhealthy',
-      error: 'Database connection failed'
+      database: 'error',
+      timestamp: new Date().toISOString(),
     }, 500);
   }
 });
 
-// Mount route modules
+// Mount routes
 app.route('/api/auth', authRoutes);
 app.route('/api', ocrRoutes);
+app.route('/api', analyticsRoutes);
 
 // 404 handler
 app.notFound((c) => {
-  return c.json({ 
-    error: 'Endpoint not found',
-    path: c.req.path,
-    method: c.req.method
+  return c.json({
+    error: 'Not Found',
+    message: 'The requested endpoint does not exist',
   }, 404);
 });
 
 // Global error handler
 app.onError((err, c) => {
-  console.error('Worker error:', err);
-  return c.json({ 
-    error: 'Internal server error',
-    message: err.message 
+  console.error('Global error:', err);
+  return c.json({
+    error: 'Internal Server Error',
+    message: err.message,
   }, 500);
 });
 
-// Export as default (required for Cloudflare Workers)
 export default app;

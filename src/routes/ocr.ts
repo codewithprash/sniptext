@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { verify } from 'hono/jwt';
 
 type Bindings = {
   DB: D1Database;
@@ -12,9 +13,23 @@ type Variables = {
   userEmail: string;
 };
 
-export const ocrRoutes = new Hono<{ 
-  Bindings: Bindings; 
-  Variables: Variables 
+// ✅ Gemini API response type
+interface GeminiResponse {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{
+        text?: string;
+      }>;
+    };
+  }>;
+  error?: {
+    message?: string;
+  };
+}
+
+export const ocrRoutes = new Hono<{
+  Bindings: Bindings;
+  Variables: Variables;
 }>();
 
 // Auth middleware - verify JWT token for ALL /ocr routes
@@ -29,20 +44,16 @@ ocrRoutes.use('/ocr/*', async (c, next) => {
 
   try {
     const token = authHeader.substring(7);
-    const payload = JSON.parse(atob(token)) as {
+    
+    // Verify JWT signature
+    const payload = await verify(token, c.env.JWT_SECRET) as {
       sub: string;
       email: string;
       plan: string;
       exp: number;
     };
 
-    console.log('Token payload:', { userId: payload.sub, plan: payload.plan });
-
-    // Check expiration
-    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
-      console.error('Token expired');
-      return c.json({ error: 'Token expired' }, 401);
-    }
+    console.log('Token verified:', { userId: payload.sub, plan: payload.plan });
 
     // Store user info in context
     c.set('userId', payload.sub);
@@ -52,7 +63,7 @@ ocrRoutes.use('/ocr/*', async (c, next) => {
     await next();
   } catch (error) {
     console.error('Auth middleware error:', error);
-    return c.json({ error: 'Invalid token' }, 401);
+    return c.json({ error: 'Invalid or expired token' }, 401);
   }
 });
 
@@ -69,9 +80,9 @@ ocrRoutes.post('/ocr', async (c) => {
 
     if (!imageBase64) {
       console.error('Missing imageBase64 in request');
-      return c.json({ 
+      return c.json({
         success: false,
-        error: 'Missing imageBase64 field' 
+        error: 'Missing imageBase64 field'
       }, 400);
     }
 
@@ -121,8 +132,8 @@ ocrRoutes.post('/ocr', async (c) => {
     // Update usage counter
     if (usage) {
       await c.env.DB
-        .prepare('UPDATE usage_daily SET count = count + 1 WHERE user_id = ? AND date = ?')
-        .bind(userId, today)
+        .prepare('UPDATE usage_daily SET count = count + 1, updated_at = ? WHERE user_id = ? AND date = ?')
+        .bind(new Date().toISOString(), userId, today)
         .run();
     } else {
       await c.env.DB
@@ -148,7 +159,7 @@ ocrRoutes.post('/ocr', async (c) => {
     console.error('OCR processing error:', error);
     console.error('Error stack:', error.stack);
     
-    return c.json({ 
+    return c.json({
       success: false,
       error: 'OCR processing failed',
       message: error.message || 'Unknown error occurred',
@@ -198,7 +209,7 @@ ocrRoutes.get('/ocr/usage', async (c) => {
   }
 });
 
-// Helper function: Call Gemini API (exact match to offline code)
+// Helper function: Call Gemini API
 async function callGeminiOCR(imageBase64: string, apiKey: string): Promise<string> {
   if (!apiKey) {
     throw new Error("Missing API key");
@@ -266,7 +277,7 @@ Extract the text now:`
     let errorMsg = `API Error ${response.status}`;
     
     try {
-      const errorData = JSON.parse(errorText);
+      const errorData = JSON.parse(errorText) as GeminiResponse;
       if (errorData.error?.message) {
         errorMsg = errorData.error.message;
       }
@@ -278,19 +289,20 @@ Extract the text now:`
     throw new Error(errorMsg);
   }
 
-  const data = await response.json();
+  // ✅ Cast response to proper type
+  const data = await response.json() as GeminiResponse;
   return extractTextFromGeminiResponse(data);
 }
 
 // Extract text from Gemini response
-function extractTextFromGeminiResponse(data: any): string {
+function extractTextFromGeminiResponse(data: GeminiResponse): string {
   const candidate = data.candidates?.[0];
   if (!candidate?.content?.parts) {
     throw new Error("No text extracted from image");
   }
 
   const text = candidate.content.parts
-    .map((part: any) => part.text || "")
+    .map((part) => part.text || "")
     .join("")
     .trim();
 
