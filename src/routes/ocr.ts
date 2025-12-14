@@ -17,9 +17,11 @@ export const ocrRoutes = new Hono<{
   Variables: Variables 
 }>();
 
-// Auth middleware - verify JWT token
-ocrRoutes.use('/ocr', async (c, next) => {
+// Auth middleware - verify JWT token for ALL /ocr routes
+ocrRoutes.use('/ocr/*', async (c, next) => {
   const authHeader = c.req.header('Authorization');
+
+  console.log('Auth middleware triggered, header:', authHeader ? 'present' : 'missing');
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return c.json({ error: 'Missing or invalid authorization header' }, 401);
@@ -27,10 +29,18 @@ ocrRoutes.use('/ocr', async (c, next) => {
 
   try {
     const token = authHeader.substring(7);
-    const payload = JSON.parse(atob(token));
+    const payload = JSON.parse(atob(token)) as {
+      sub: string;
+      email: string;
+      plan: string;
+      exp: number;
+    };
+
+    console.log('Token payload:', { userId: payload.sub, plan: payload.plan });
 
     // Check expiration
     if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
+      console.error('Token expired');
       return c.json({ error: 'Token expired' }, 401);
     }
 
@@ -41,6 +51,7 @@ ocrRoutes.use('/ocr', async (c, next) => {
 
     await next();
   } catch (error) {
+    console.error('Auth middleware error:', error);
     return c.json({ error: 'Invalid token' }, 401);
   }
 });
@@ -50,12 +61,28 @@ ocrRoutes.post('/ocr', async (c) => {
   const userId = c.get('userId');
   const userPlan = c.get('userPlan');
 
+  console.log(`OCR request from user: ${userId}, plan: ${userPlan}`);
+
   try {
-    // Get request body
-    const { imageBase64 } = await c.req.json();
+    const body = await c.req.json();
+    const { imageBase64 } = body;
 
     if (!imageBase64) {
-      return c.json({ error: 'Missing imageBase64 field' }, 400);
+      console.error('Missing imageBase64 in request');
+      return c.json({ 
+        success: false,
+        error: 'Missing imageBase64 field' 
+      }, 400);
+    }
+
+    console.log(`Image data length: ${imageBase64.length} characters`);
+
+    if (!c.env.GEMINI_API_KEY) {
+      console.error('GEMINI_API_KEY not configured');
+      return c.json({
+        success: false,
+        error: 'OCR service not configured. Please contact support.'
+      }, 500);
     }
 
     // Check daily usage limits
@@ -74,8 +101,11 @@ ocrRoutes.post('/ocr', async (c) => {
     const limit = limits[userPlan] || 20;
     const used = usage?.count || 0;
 
+    console.log(`Usage check: ${used}/${limit} for plan ${userPlan}`);
+
     if (used >= limit) {
       return c.json({
+        success: false,
         error: 'Daily limit exceeded',
         limit,
         used,
@@ -84,8 +114,9 @@ ocrRoutes.post('/ocr', async (c) => {
       }, 429);
     }
 
-    // Call Gemini API for OCR
+    console.log('Calling Gemini API...');
     const extractedText = await callGeminiOCR(imageBase64, c.env.GEMINI_API_KEY);
+    console.log(`OCR successful, extracted ${extractedText.length} characters`);
 
     // Update usage counter
     if (usage) {
@@ -100,6 +131,8 @@ ocrRoutes.post('/ocr', async (c) => {
         .run();
     }
 
+    console.log(`Usage updated: ${used + 1}/${limit}`);
+
     return c.json({
       success: true,
       text: extractedText,
@@ -113,55 +146,77 @@ ocrRoutes.post('/ocr', async (c) => {
 
   } catch (error: any) {
     console.error('OCR processing error:', error);
+    console.error('Error stack:', error.stack);
+    
     return c.json({ 
+      success: false,
       error: 'OCR processing failed',
-      message: error.message 
+      message: error.message || 'Unknown error occurred',
+      details: error.toString()
     }, 500);
   }
 });
 
 // GET /api/ocr/usage - Check current usage
-ocrRoutes.get('/usage', async (c) => {
+ocrRoutes.get('/ocr/usage', async (c) => {
   const userId = c.get('userId');
   const userPlan = c.get('userPlan');
 
-  const today = new Date().toISOString().slice(0, 10);
-  const usage = await c.env.DB
-    .prepare('SELECT count FROM usage_daily WHERE user_id = ? AND date = ?')
-    .bind(userId, today)
-    .first<{ count: number }>();
+  console.log(`Usage check for user: ${userId}, plan: ${userPlan}`);
 
-  const limits: Record<string, number> = {
-    free: 20,
-    pro: 1000,
-    'pro-plus': 5000,
-    enterprise: 999999
-  };
-  const limit = limits[userPlan] || 20;
-  const used = usage?.count || 0;
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const usage = await c.env.DB
+      .prepare('SELECT count FROM usage_daily WHERE user_id = ? AND date = ?')
+      .bind(userId, today)
+      .first<{ count: number }>();
 
-  return c.json({
-    plan: userPlan,
-    used,
-    limit,
-    remaining: limit - used,
-    date: today
-  });
+    const limits: Record<string, number> = {
+      free: 20,
+      pro: 1000,
+      'pro-plus': 5000,
+      enterprise: 999999
+    };
+    const limit = limits[userPlan] || 20;
+    const used = usage?.count || 0;
+
+    console.log(`Usage stats: ${used}/${limit}, remaining: ${limit - used}`);
+
+    return c.json({
+      plan: userPlan,
+      used,
+      limit,
+      remaining: limit - used,
+      date: today
+    });
+  } catch (error) {
+    console.error('Usage check error:', error);
+    return c.json({
+      error: 'Failed to fetch usage',
+      details: error instanceof Error ? error.message : 'Unknown error'
+    }, 500);
+  }
 });
 
-// Helper function: Call Gemini API
+// Helper function: Call Gemini API (exact match to offline code)
 async function callGeminiOCR(imageBase64: string, apiKey: string): Promise<string> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${apiKey}`;
+  if (!apiKey) {
+    throw new Error("Missing API key");
+  }
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{
+  const model = "gemini-flash-lite-latest";
+  
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  console.log("[SnipText OCR] Using model:", model);
+
+  const body = {
+    contents: [
+      {
         parts: [
           {
             inline_data: {
-              mime_type: 'image/png',
+              mime_type: "image/png",
               data: imageBase64
             }
           },
@@ -175,7 +230,7 @@ CRITICAL REQUIREMENTS:
 4. Detect and preserve multi-column layouts (read left-to-right, top-to-bottom)
 5. Maintain paragraph breaks and vertical spacing between sections
 6. Preserve mathematical formulas, special characters, and symbols
-7. Support ALL languages (English, Hindi, code, etc.)
+7. Support ALL languages (English, Hindi, etc.)
 8. Keep code formatting if present (indentation, syntax)
 
 OUTPUT FORMAT:
@@ -190,27 +245,59 @@ OUTPUT FORMAT:
 Extract the text now:`
           }
         ]
-      }],
-      generationConfig: {
-        temperature: 0,
-        topP: 0.95,
-        topK: 20,
-        maxOutputTokens: 8192
       }
-    })
+    ],
+    generationConfig: {
+      temperature: 0,
+      topP: 0.95,
+      topK: 20,
+      maxOutputTokens: 8192
+    }
+  };
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
   });
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Gemini API error ${response.status}: ${errorText}`);
+    let errorMsg = `API Error ${response.status}`;
+    
+    try {
+      const errorData = JSON.parse(errorText);
+      if (errorData.error?.message) {
+        errorMsg = errorData.error.message;
+      }
+    } catch (e) {
+      errorMsg = errorText;
+    }
+    
+    console.error('Gemini API error:', errorMsg);
+    throw new Error(errorMsg);
   }
 
   const data = await response.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  return extractTextFromGeminiResponse(data);
+}
 
-  if (!text || text.trim().length === 0) {
-    throw new Error('No text extracted from image');
+// Extract text from Gemini response
+function extractTextFromGeminiResponse(data: any): string {
+  const candidate = data.candidates?.[0];
+  if (!candidate?.content?.parts) {
+    throw new Error("No text extracted from image");
   }
 
-  return text.trim();
+  const text = candidate.content.parts
+    .map((part: any) => part.text || "")
+    .join("")
+    .trim();
+
+  if (!text || text.length === 0) {
+    throw new Error("No text extracted from image");
+  }
+
+  console.log(`OCR successful, extracted ${text.length} characters`);
+  return text;
 }

@@ -5,21 +5,52 @@ type Bindings = {
   JWT_SECRET: string;
 };
 
+// Type definition for Google token info
+interface GoogleTokenInfo {
+  email: string;
+  email_verified: string;
+  azp: string;
+  exp: string;
+  aud?: string;
+}
+
 export const authRoutes = new Hono<{ Bindings: Bindings }>();
 
-// POST /api/auth/login - Request magic link
-authRoutes.post('/login', async (c) => {
+// POST /api/auth/google - Google OAuth authentication
+authRoutes.post('/google', async (c) => {
   try {
-    const { email } = await c.req.json();
+    const { googleToken, email, name, picture } = await c.req.json();
 
-    // Validate email
-    if (!email || !email.includes('@')) {
-      return c.json({ error: 'Invalid email address' }, 400);
+    console.log('Google auth request for:', email);
+
+    if (!email) {
+      return c.json({ error: 'Missing email' }, 400);
     }
 
-    // Generate session credentials
-    const sessionId = crypto.randomUUID();
-    const verifyToken = crypto.randomUUID();
+    // Optional: Verify Google token with Google's API (recommended for production)
+    if (googleToken) {
+      try {
+        const verifyResponse = await fetch(
+          `https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=${googleToken}`
+        );
+
+        if (!verifyResponse.ok) {
+          console.error('Google token verification failed');
+          return c.json({ error: 'Invalid Google token' }, 401);
+        }
+
+        const tokenInfo = await verifyResponse.json() as GoogleTokenInfo;
+        console.log('Google token verified:', tokenInfo.email);
+
+        // Ensure the email matches
+        if (tokenInfo.email !== email) {
+          return c.json({ error: 'Email mismatch' }, 401);
+        }
+      } catch (verifyError) {
+        console.error('Token verification error:', verifyError);
+        return c.json({ error: 'Token verification failed' }, 401);
+      }
+    }
 
     // Find or create user
     let user = await c.env.DB
@@ -30,6 +61,8 @@ authRoutes.post('/login', async (c) => {
     if (!user) {
       // Create new user with free plan
       const userId = crypto.randomUUID();
+      console.log('Creating new user:', userId, email);
+
       await c.env.DB
         .prepare(
           'INSERT INTO users (id, email, plan, created_at) VALUES (?, ?, ?, ?)'
@@ -38,215 +71,44 @@ authRoutes.post('/login', async (c) => {
         .run();
 
       user = { id: userId, email, plan: 'free' };
+    } else {
+      console.log('Existing user found:', user.id);
     }
 
-    // Store pending auth session (expires in 10 minutes)
-    await c.env.DB
-      .prepare(
-        `INSERT INTO auth_sessions (session_id, user_id, verify_token, expires_at, verified)
-         VALUES (?, ?, ?, datetime('now', '+10 minutes'), 0)`
-      )
-      .bind(sessionId, user.id, verifyToken)
-      .run();
+    // Generate JWT token
+    const payload = {
+      sub: user.id,
+      email: user.email,
+      plan: user.plan,
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 30) // 30 days
+    };
 
-    // Generate magic link (in production, send via email service)
-    const baseUrl = new URL(c.req.url).origin;
-    const magicLink = `${baseUrl}/api/auth/verify?token=${verifyToken}&session=${sessionId}`;
+    const token = btoa(JSON.stringify(payload));
 
-    // TODO: Send email with magicLink using service like Resend, SendGrid, etc.
-    console.log('Magic link for', email, ':', magicLink);
+    console.log('Authentication successful for:', email);
 
     return c.json({
       success: true,
-      sessionId,
-      message: 'Check your email for the login link',
-      // REMOVE IN PRODUCTION:
-      _dev_magic_link: magicLink
-    });
-
-  } catch (error) {
-    console.error('Login error:', error);
-    return c.json({ error: 'Login failed' }, 500);
-  }
-});
-
-// GET /api/auth/verify - User clicks magic link
-authRoutes.get('/verify', async (c) => {
-  const token = c.req.query('token');
-  const sessionId = c.req.query('session');
-
-  if (!token || !sessionId) {
-    return c.html(`
-      <html>
-        <body style="font-family: system-ui; text-align: center; padding: 50px;">
-          <h1>❌ Invalid authentication link</h1>
-          <p>Please request a new login link from the extension.</p>
-        </body>
-      </html>
-    `);
-  }
-
-  try {
-    // Verify session exists and is valid
-    const session = await c.env.DB
-      .prepare(
-        `SELECT user_id, verified, expires_at 
-         FROM auth_sessions 
-         WHERE session_id = ? AND verify_token = ?`
-      )
-      .bind(sessionId, token)
-      .first<{ user_id: string; verified: number; expires_at: string }>();
-
-    if (!session) {
-      return c.html(`
-        <html>
-          <body style="font-family: system-ui; text-align: center; padding: 50px;">
-            <h1>❌ Invalid link</h1>
-            <p>This authentication link is not valid.</p>
-          </body>
-        </html>
-      `);
-    }
-
-    // Check if expired
-    if (new Date(session.expires_at) < new Date()) {
-      return c.html(`
-        <html>
-          <body style="font-family: system-ui; text-align: center; padding: 50px;">
-            <h1>⏰ Link expired</h1>
-            <p>This authentication link has expired. Please request a new one.</p>
-          </body>
-        </html>
-      `);
-    }
-
-    // Mark session as verified
-    await c.env.DB
-      .prepare('UPDATE auth_sessions SET verified = 1 WHERE session_id = ?')
-      .bind(sessionId)
-      .run();
-
-    return c.html(`
-      <html>
-        <head>
-          <style>
-            body {
-              font-family: system-ui, -apple-system, sans-serif;
-              text-align: center;
-              padding: 50px;
-              background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-              color: white;
-            }
-            .card {
-              background: white;
-              color: #333;
-              max-width: 500px;
-              margin: 50px auto;
-              padding: 40px;
-              border-radius: 20px;
-              box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            }
-            h1 { margin: 0 0 20px 0; }
-          </style>
-        </head>
-        <body>
-          <div class="card">
-            <h1>✅ Authentication Successful!</h1>
-            <p>You can now close this window and return to the SnipText extension.</p>
-            <p style="color: #666; font-size: 14px; margin-top: 30px;">
-              The extension should automatically detect your login.
-            </p>
-          </div>
-        </body>
-      </html>
-    `);
-
-  } catch (error) {
-    console.error('Verify error:', error);
-    return c.html(`
-      <html>
-        <body style="font-family: system-ui; text-align: center; padding: 50px;">
-          <h1>❌ Verification failed</h1>
-          <p>An error occurred. Please try again.</p>
-        </body>
-      </html>
-    `);
-  }
-});
-
-// GET /api/auth/poll - Extension polls for JWT after user clicks link
-authRoutes.get('/poll', async (c) => {
-  const sessionId = c.req.query('sessionId');
-
-  if (!sessionId) {
-    return c.json({ error: 'Missing sessionId parameter' }, 400);
-  }
-
-  try {
-    // Check session status
-    const session = await c.env.DB
-      .prepare(
-        `SELECT s.user_id, s.verified, u.email, u.plan
-         FROM auth_sessions s
-         JOIN users u ON s.user_id = u.id
-         WHERE s.session_id = ? AND s.expires_at > datetime('now')`
-      )
-      .bind(sessionId)
-      .first<{ user_id: string; verified: number; email: string; plan: string }>();
-
-    if (!session) {
-      return c.json({ 
-        authenticated: false, 
-        error: 'Invalid or expired session' 
-      });
-    }
-
-    // Still waiting for user to click magic link
-    if (session.verified === 0) {
-      return c.json({ 
-        authenticated: false, 
-        status: 'pending',
-        message: 'Waiting for email verification' 
-      });
-    }
-
-    // Session verified! Generate JWT token
-    const payload = {
-      sub: session.user_id,
-      email: session.email,
-      plan: session.plan,
-      iat: Math.floor(Date.now() / 1000),
-      exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 7) // 7 days
-    };
-
-    // Simple JWT (in production use proper JWT library like jose or @tsndr/cloudflare-worker-jwt)
-    const token = btoa(JSON.stringify(payload));
-
-    // Clean up used session
-    await c.env.DB
-      .prepare('DELETE FROM auth_sessions WHERE session_id = ?')
-      .bind(sessionId)
-      .run();
-
-    return c.json({
-      authenticated: true,
       token,
       user: {
-        id: session.user_id,
-        email: session.email,
-        plan: session.plan
+        id: user.id,
+        email: user.email,
+        plan: user.plan
       }
     });
 
   } catch (error) {
-    console.error('Poll error:', error);
-    return c.json({ error: 'Authentication check failed' }, 500);
+    console.error('Google auth error:', error);
+    return c.json({ 
+      error: 'Authentication failed',
+      details: error instanceof Error ? error.message : 'Unknown error'
+    }, 500);
   }
 });
 
 // GET /api/auth/me - Get current user info (requires auth)
 authRoutes.get('/me', async (c) => {
-  // TODO: Add JWT middleware
   const authHeader = c.req.header('Authorization');
   
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -255,19 +117,176 @@ authRoutes.get('/me', async (c) => {
 
   try {
     const token = authHeader.substring(7);
-    const payload = JSON.parse(atob(token));
+    const payload = JSON.parse(atob(token)) as {
+      sub: string;
+      email: string;
+      plan: string;
+      exp: number;
+    };
+
+    // Check expiration
+    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
+      return c.json({ error: 'Token expired' }, 401);
+    }
 
     const user = await c.env.DB
       .prepare('SELECT id, email, plan, created_at FROM users WHERE id = ?')
       .bind(payload.sub)
-      .first();
+      .first<{ id: string; email: string; plan: string; created_at: string }>();
 
     if (!user) {
       return c.json({ error: 'User not found' }, 404);
     }
 
-    return c.json({ user });
+    return c.json({ 
+      success: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        plan: user.plan,
+        createdAt: user.created_at
+      }
+    });
   } catch (error) {
+    console.error('Get user error:', error);
     return c.json({ error: 'Invalid token' }, 401);
+  }
+});
+
+// POST /api/auth/refresh - Refresh token
+authRoutes.post('/refresh', async (c) => {
+  const authHeader = c.req.header('Authorization');
+  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  try {
+    const token = authHeader.substring(7);
+    const payload = JSON.parse(atob(token)) as {
+      sub: string;
+      email: string;
+      plan: string;
+    };
+
+    // Get latest user data
+    const user = await c.env.DB
+      .prepare('SELECT id, email, plan FROM users WHERE id = ?')
+      .bind(payload.sub)
+      .first<{ id: string; email: string; plan: string }>();
+
+    if (!user) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    // Generate new token
+    const newPayload = {
+      sub: user.id,
+      email: user.email,
+      plan: user.plan,
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 30)
+    };
+
+    const newToken = btoa(JSON.stringify(newPayload));
+
+    return c.json({
+      success: true,
+      token: newToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        plan: user.plan
+      }
+    });
+
+  } catch (error) {
+    console.error('Refresh token error:', error);
+    return c.json({ error: 'Token refresh failed' }, 500);
+  }
+});
+
+// DELETE /api/auth/logout - Logout (revoke token)
+authRoutes.delete('/logout', async (c) => {
+  // With JWT, logout is handled client-side by deleting the token
+  // You could implement a token blacklist in D1 if needed
+  
+  return c.json({
+    success: true,
+    message: 'Logged out successfully'
+  });
+});
+
+// GET /api/auth/status - Check auth status
+authRoutes.get('/status', async (c) => {
+  const authHeader = c.req.header('Authorization');
+  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ 
+      authenticated: false,
+      message: 'No auth token provided'
+    });
+  }
+
+  try {
+    const token = authHeader.substring(7);
+    const payload = JSON.parse(atob(token)) as {
+      sub: string;
+      exp: number;
+    };
+
+    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
+      return c.json({ 
+        authenticated: false,
+        message: 'Token expired'
+      });
+    }
+
+    const user = await c.env.DB
+      .prepare('SELECT id FROM users WHERE id = ?')
+      .bind(payload.sub)
+      .first();
+
+    return c.json({
+      authenticated: !!user,
+      message: user ? 'Valid token' : 'User not found'
+    });
+
+  } catch (error) {
+    return c.json({ 
+      authenticated: false,
+      message: 'Invalid token'
+    });
+  }
+});
+
+// DEBUG endpoint - Get all users (REMOVE IN PRODUCTION)
+authRoutes.get('/debug/users', async (c) => {
+  const users = await c.env.DB
+    .prepare('SELECT id, email, plan, created_at FROM users ORDER BY created_at DESC LIMIT 10')
+    .all();
+  
+  return c.json({
+    users: users.results,
+    count: users.results?.length || 0
+  });
+});
+
+// DEBUG endpoint - Check database connection (REMOVE IN PRODUCTION)
+authRoutes.get('/debug/db', async (c) => {
+  try {
+    const result = await c.env.DB
+      .prepare('SELECT COUNT(*) as count FROM users')
+      .first<{ count: number }>();
+    
+    return c.json({
+      status: 'connected',
+      totalUsers: result?.count || 0
+    });
+  } catch (error) {
+    return c.json({
+      status: 'error',
+      error: error instanceof Error ? error.message : 'Unknown error'
+    }, 500);
   }
 });
